@@ -704,6 +704,11 @@ typedef enum {
 #define HLL_DENSE_ENCODING_CLASSIC 0
 #define HLL_DENSE_ENCODING_ULTRA 1
 
+/* hll-ultra-p: UltraLogLog precision (number of registers = 2^p).
+ * p=15 deferred: classic sparse is p=14, can't synthesize higher on promotion. */
+#define HLL_ULTRA_P_MIN 13
+#define HLL_ULTRA_P_MAX 14
+
 /* Units */
 #define UNIT_SECONDS 0
 #define UNIT_MILLISECONDS 1
@@ -2459,6 +2464,7 @@ struct redisServer {
     size_t zset_max_listpack_value;
     size_t hll_sparse_max_bytes;
     int hll_dense_encoding;      /* HLL_DENSE_ENCODING_CLASSIC or _ULTRA */
+    int hll_ultra_p;             /* UltraLogLog precision: HLL_ULTRA_P_MIN..HLL_ULTRA_P_MAX */
     size_t stream_node_max_bytes;
     long long stream_node_max_entries;
     /* Stream IDMP parameters */

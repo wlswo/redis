@@ -522,4 +522,43 @@ start_server {tags {"hll"}} {
         assert {abs([r pfcount md] - 7500) < 7500*0.05}
         r config set hll-sparse-max-bytes 3000
     }
+
+    test {ULL p13: hll-ultra-p accepts 13 and 14, rejects 12/15} {
+        r config set hll-ultra-p 13
+        assert_equal {13} [lindex [r config get hll-ultra-p] 1]
+        r config set hll-ultra-p 14
+        assert_error "*argument*" {r config set hll-ultra-p 12}
+        assert_error "*argument*" {r config set hll-ultra-p 15}
+    }
+    test {ULL p13: native add/count accurate at scale} {
+        r config set hll-dense-encoding ultra; r config set hll-ultra-p 13; r config set hll-sparse-max-bytes 0
+        r del n13
+        for {set i 0} {$i < 50000} {incr i} { r pfadd n13 "n$i" }
+        assert_equal {ultra} [r pfdebug encoding n13]
+        assert {abs([r pfcount n13] - 50000) < 50000*0.02}
+        r config set hll-sparse-max-bytes 3000; r config set hll-dense-encoding classic; r config set hll-ultra-p 14
+    }
+    test {ULL p13: PFMERGE of two p13 keys is accurate and idempotent} {
+        r config set hll-dense-encoding ultra; r config set hll-ultra-p 13; r config set hll-sparse-max-bytes 0
+        r del a13 b13 d13
+        for {set i 0} {$i < 20000} {incr i} { r pfadd a13 "x$i" }
+        for {set i 10000} {$i < 30000} {incr i} { r pfadd b13 "x$i" }
+        r pfmerge d13 a13 b13
+        assert_equal {ultra} [r pfdebug encoding d13]
+        assert {abs([r pfcount d13] - 30000) < 30000*0.04}
+        set once [r pfcount d13]; r pfmerge d13 a13 b13; assert_equal $once [r pfcount d13]
+        r config set hll-sparse-max-bytes 3000; r config set hll-dense-encoding classic; r config set hll-ultra-p 14
+    }
+    test {ULL p13: PFMERGE of a p14 and a p13 key folds to p13, accurate} {
+        r config set hll-dense-encoding ultra; r config set hll-sparse-max-bytes 0
+        r del u14 u13 dm
+        r config set hll-ultra-p 14
+        for {set i 0} {$i < 20000} {incr i} { r pfadd u14 "x$i" }
+        r config set hll-ultra-p 13
+        for {set i 10000} {$i < 30000} {incr i} { r pfadd u13 "x$i" }
+        r pfmerge dm u14 u13
+        assert_equal {ultra} [r pfdebug encoding dm]
+        assert {abs([r pfcount dm] - 30000) < 30000*0.04}
+        r config set hll-sparse-max-bytes 3000; r config set hll-dense-encoding classic; r config set hll-ultra-p 14
+    }
 }

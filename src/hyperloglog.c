@@ -210,7 +210,8 @@ struct hllhdr {
 #define HLL_ULTRA_SET_P(hdr,p) ((hdr)->notused[0] = (uint8_t)(p))
 #define HLL_ULTRA_REGISTERS(p) ((size_t)1 << (p))
 #define HLL_ULTRA_DENSE_SIZE(p) (HLL_HDR_SIZE + HLL_ULTRA_REGISTERS(p))
-#define HLL_ULTRA_P 14 /* v1: UltraLogLog precision is fixed at 14 (matches classic sparse/dense). p=13/15 are a future follow-up. */
+/* HLL_ULTRA_P is no longer a compile-time constant — use server.hll_ultra_p at runtime.
+ * Valid range: HLL_ULTRA_P_MIN..HLL_ULTRA_P_MAX (defined in server.h). */
 
 static char *invalid_hll_err = "-INVALIDOBJ Corrupted HLL object detected";
 
@@ -565,18 +566,37 @@ static int ullDenseAdd(uint8_t *registers, int p, unsigned char *ele, size_t ele
     return 0;
 }
 
-/* Apply a classic register (index, rho) to a ULL p=14 dense array. Returns 1
- * if the register changed. ULL u = rho + HLL_ULTRA_P - 2. */
-static int ullApplyClassicReg(uint8_t *registers, long index, uint8_t rho) {
-    uint64_t hp = ullUnpack(registers[index]) | ((uint64_t)1 << (rho + HLL_ULTRA_P - 2));
+/* Apply a classic register (index, rho) to a ULL dense array of precision p.
+ * For p >= 14: register maps 1:1 (idx=index, u = rho + p - 2).
+ * For p < 14 (p=13): register index is folded into the lower p bits;
+ *   if bit p of index is set, the high-half collapses to rho=1 (bit p-1 in u-space);
+ *   otherwise u = rho + (14 - p) to preserve FGRA calibration.
+ * Returns 1 if the register changed. */
+static int ullApplyClassicReg(uint8_t *registers, int p, long index, uint8_t rho) {
+    long idx; int r;
+    if (p >= 14) { idx = index; r = rho; }
+    else { idx = index & (((long)1 << p) - 1); r = ((index >> p) & 1) ? 1 : (rho + (14 - p)); }
+    uint64_t hp = ullUnpack(registers[idx]) | ((uint64_t)1 << (r + p - 2));
     uint8_t newr = ullPack(hp);
-    if (newr != registers[index]) { registers[index] = newr; return 1; }
+    if (newr != registers[idx]) { registers[idx] = newr; return 1; }
     return 0;
 }
 
-/* Classic rho stored in a p=14 ULL register byte (0 if empty).
- * Inverse of ullApplyClassicReg: rho = (r>>2) - HLL_ULTRA_P + 2 = (r>>2) - 12. */
-static inline int ullRegToRho(uint8_t r) { return r ? ((r >> 2) - HLL_ULTRA_P + 2) : 0; }
+/* Classic rho stored in a ULL register byte at precision p (0 if empty).
+ * Inverse of ullApplyClassicReg: rho = (r>>2) - p + 2. */
+static inline int ullRegToRho(uint8_t r, int p) { return r ? ((r >> 2) - p + 2) : 0; }
+
+/* Fold a ULL p=14 register array into a ULL p=13 accumulator, PRESERVING flag bits
+ * (FGRA stays calibrated). Low-half (bit13=0) bits are identical in p13; high-half
+ * (bit13=1) collapses to rho13=1. Verified byte-identical to a native p13 sketch. */
+static void ullFold14To13(uint8_t *acc13, const uint8_t *src14) {
+    size_t m13 = (size_t)1 << 13;
+    for (size_t i = 0; i < m13; i++) {
+        uint64_t hp = ullUnpack(acc13[i]) | ullUnpack(src14[i]);
+        if (src14[i + m13]) hp |= (uint64_t)1 << (13 - 1);
+        if (hp) acc13[i] = ullPack(hp);
+    }
+}
 
 /* ======= UltraLogLog FGRA histogram estimator (ported from validated prototype) =======
  *
@@ -758,7 +778,7 @@ static uint64_t ullCount(struct hllhdr *hdr) {
 /* Self-test for the UltraLogLog dense codec + add path. Returns NULL on
  * success or a static error string describing the first failure. */
 static const char *ullSelfTest(void) {
-    int p = HLL_ULTRA_P;
+    int p = HLL_ULTRA_P_MAX;
     size_t m = HLL_ULTRA_REGISTERS(p);
     int N = 100000;
     uint8_t *regs = zcalloc(m);
@@ -941,9 +961,10 @@ int hllSparseToDense(robj *o) {
     return C_OK;
 }
 
-/* Convert the sparse representation of 'o' to a dense UltraLogLog at p=14.
- * Mirrors hllSparseToDense but writes 1-byte ULL registers. */
-int hllSparseToDenseUltra(robj *o) {
+/* Convert the sparse representation of 'o' to a dense UltraLogLog at precision p.
+ * Mirrors hllSparseToDense but writes 1-byte ULL registers.
+ * p must be in [HLL_ULTRA_P_MIN, HLL_ULTRA_P_MAX]. */
+int hllSparseToDenseUltra(robj *o, int p) {
     sds sparse = o->ptr, dense;
     struct hllhdr *hdr, *oldhdr = (struct hllhdr*)sparse;
     int idx = 0, runlen, regval;
@@ -951,11 +972,11 @@ int hllSparseToDenseUltra(robj *o) {
     int valid = 1;
     hdr = (struct hllhdr*) sparse;
     if (hdr->encoding == HLL_ULTRA) return C_OK;
-    dense = sdsnewlen(NULL, HLL_ULTRA_DENSE_SIZE(HLL_ULTRA_P));
+    dense = sdsnewlen(NULL, HLL_ULTRA_DENSE_SIZE(p));
     hdr = (struct hllhdr*) dense;
     *hdr = *oldhdr;                 /* copy magic + cached cardinality */
     hdr->encoding = HLL_ULTRA;
-    HLL_ULTRA_SET_P(hdr, HLL_ULTRA_P);
+    HLL_ULTRA_SET_P(hdr, p);
     HLL_INVALIDATE_CACHE(hdr);      /* recompute via ullCount (different estimator) */
     p_ += HLL_HDR_SIZE;
     while (p_ < end) {
@@ -972,7 +993,7 @@ int hllSparseToDenseUltra(robj *o) {
             regval = HLL_SPARSE_VAL_VALUE(p_);
             if ((runlen + idx) > HLL_REGISTERS) { valid = 0; break; }
             while (runlen--) {
-                ullApplyClassicReg(hdr->registers, idx, (uint8_t)regval);
+                ullApplyClassicReg(hdr->registers, p, idx, (uint8_t)regval);
                 idx++;
             }
             p_++;
@@ -1239,9 +1260,9 @@ updated:
 
 promote: /* Promote to dense representation. */
     if (server.hll_dense_encoding == HLL_DENSE_ENCODING_ULTRA) {
-        if (hllSparseToDenseUltra(o) == C_ERR) return -1;
+        if (hllSparseToDenseUltra(o, server.hll_ultra_p) == C_ERR) return -1;
         hdr = o->ptr;
-        ullApplyClassicReg(hdr->registers, index, count);
+        ullApplyClassicReg(hdr->registers, server.hll_ultra_p, index, count);
         return 1; /* object promoted sparse->dense-ultra, so it changed */
     }
     if (hllSparseToDense(o) == C_ERR) return -1; /* Corrupted HLL. */
@@ -1949,10 +1970,11 @@ int isHLLObjectOrReply(client *c, robj *o) {
     if (hdr->encoding == HLL_DENSE &&
         stringObjectLen(o) != HLL_DENSE_SIZE) goto invalid;
 
-    /* UltraLogLog: precision must be exactly HLL_ULTRA_P and the string length exact. */
+    /* UltraLogLog: precision must be in [HLL_ULTRA_P_MIN, HLL_ULTRA_P_MAX] and
+     * the string length must match exactly. */
     if (hdr->encoding == HLL_ULTRA) {
         int up = HLL_ULTRA_GET_P(hdr);
-        if (up != HLL_ULTRA_P) goto invalid;
+        if (up < HLL_ULTRA_P_MIN || up > HLL_ULTRA_P_MAX) goto invalid;
         if (stringObjectLen(o) != HLL_ULTRA_DENSE_SIZE(up)) goto invalid;
     }
 
@@ -2059,21 +2081,36 @@ void pfcountCommand(client *c) {
             }
             addReplyLongLong(c,hllCount(hdr,NULL));
         } else if (!has_classic) {
-            /* All-ULL path: union in ULL domain, estimate with FGRA. */
-            uint8_t *acc = zcalloc(HLL_REGISTERS);
+            /* All-ULL path: union in ULL domain at min_p, estimate with FGRA. */
+            int min_p = HLL_ULTRA_P_MAX;
             for (j = 1; j < c->argc; j++) {
                 kvobj *o = lookupKeyRead(c->db,c->argv[j]);
                 if (o == NULL) continue;
                 struct hllhdr *shdr = o->ptr;
+                int ps = HLL_ULTRA_GET_P(shdr);
+                if (ps < min_p) min_p = ps;
+            }
+            uint8_t *acc = zcalloc((size_t)1 << min_p);
+            for (j = 1; j < c->argc; j++) {
+                kvobj *o = lookupKeyRead(c->db,c->argv[j]);
+                if (o == NULL) continue;
+                struct hllhdr *shdr = o->ptr;
+                int ps = HLL_ULTRA_GET_P(shdr);
                 uint8_t *src = shdr->registers;
-                for (int i = 0; i < HLL_REGISTERS; i++) {
-                    if (src[i]) {
-                        uint64_t merged = ullUnpack(acc[i]) | ullUnpack(src[i]);
-                        acc[i] = ullPack(merged);
+                if (ps == min_p) {
+                    size_t ms = (size_t)1 << min_p;
+                    for (size_t i = 0; i < ms; i++) {
+                        if (src[i]) {
+                            uint64_t merged = ullUnpack(acc[i]) | ullUnpack(src[i]);
+                            acc[i] = ullPack(merged);
+                        }
                     }
+                } else {
+                    /* ps > min_p: currently only ps=14, min_p=13 */
+                    ullFold14To13(acc, src);
                 }
             }
-            addReplyLongLong(c, (long long)ullCountRegisters(acc, HLL_ULTRA_P));
+            addReplyLongLong(c, (long long)ullCountRegisters(acc, min_p));
             zfree(acc);
         } else {
             /* Mixed path: down-convert ULL to classic rho, merge all into RAW. */
@@ -2087,11 +2124,19 @@ void pfcountCommand(client *c) {
                 if (o == NULL) continue;
                 struct hllhdr *shdr = o->ptr;
                 if (shdr->encoding == HLL_ULTRA) {
+                    int ps = HLL_ULTRA_GET_P(shdr);
                     uint8_t *src = shdr->registers;
-                    for (int i = 0; i < HLL_REGISTERS; i++) {
+                    size_t ms = HLL_ULTRA_REGISTERS(ps);
+                    for (size_t i = 0; i < ms; i++) {
                         if (src[i]) {
-                            int rho = ullRegToRho(src[i]);
-                            if (rho > registers[i]) registers[i] = (uint8_t)rho;
+                            int rho = ullRegToRho(src[i], ps);
+                            /* Map p=13 register back to the classic p=14 index.
+                             * Each p=13 register covers a pair of p=14 registers. */
+                            long base = (ps < 14) ? (long)(i << (14 - ps)) : (long)i;
+                            long span = (ps < 14) ? (1L << (14 - ps)) : 1L;
+                            for (long k = 0; k < span; k++) {
+                                if (rho > registers[base + k]) registers[base + k] = (uint8_t)rho;
+                            }
                         }
                     }
                 } else {
@@ -2254,11 +2299,18 @@ void pfmergeCommand(client *c) {
             if (o == NULL) continue;
             hdr = o->ptr;
             if (hdr->encoding == HLL_ULTRA) {
+                int ps = HLL_ULTRA_GET_P(hdr);
                 uint8_t *src = hdr->registers;
-                for (int i = 0; i < HLL_REGISTERS; i++) {
+                size_t ms = HLL_ULTRA_REGISTERS(ps);
+                for (size_t i = 0; i < ms; i++) {
                     if (src[i]) {
-                        int rho = ullRegToRho(src[i]);
-                        if (rho > max[i]) max[i] = (uint8_t)rho;
+                        int rho = ullRegToRho(src[i], ps);
+                        /* Map p=13 register back to the classic p=14 index. */
+                        long base = (ps < 14) ? (long)(i << (14 - ps)) : (long)i;
+                        long span = (ps < 14) ? (1L << (14 - ps)) : 1L;
+                        for (long k = 0; k < span; k++) {
+                            if (rho > max[base + k]) max[base + k] = (uint8_t)rho;
+                        }
                     }
                 }
             } else {
@@ -2305,20 +2357,35 @@ void pfmergeCommand(client *c) {
         return;
     }
 
-    /* All-ULL path: union in ULL domain, result is a fresh ULL dense object.
+    /* All-ULL path: union in ULL domain at min_p, result is a fresh ULL dense object.
      * Note: dest (argv[1]) is included in the source scan above, so its current
      * content is merged into acc before we overwrite it. */
-    uint8_t *acc = zcalloc(HLL_REGISTERS);
+    int min_p = HLL_ULTRA_P_MAX;
     for (j = 1; j < c->argc; j++) {
         kvobj *o = lookupKeyRead(c->db, c->argv[j]);
         if (o == NULL) continue;
         struct hllhdr *shdr = o->ptr;
+        int ps = HLL_ULTRA_GET_P(shdr);
+        if (ps < min_p) min_p = ps;
+    }
+    uint8_t *acc = zcalloc((size_t)1 << min_p);
+    for (j = 1; j < c->argc; j++) {
+        kvobj *o = lookupKeyRead(c->db, c->argv[j]);
+        if (o == NULL) continue;
+        struct hllhdr *shdr = o->ptr;
+        int ps = HLL_ULTRA_GET_P(shdr);
         uint8_t *src = shdr->registers;
-        for (int i = 0; i < HLL_REGISTERS; i++) {
-            if (src[i]) {
-                uint64_t merged = ullUnpack(acc[i]) | ullUnpack(src[i]);
-                acc[i] = ullPack(merged);
+        if (ps == min_p) {
+            size_t ms = (size_t)1 << min_p;
+            for (size_t i = 0; i < ms; i++) {
+                if (src[i]) {
+                    uint64_t merged = ullUnpack(acc[i]) | ullUnpack(src[i]);
+                    acc[i] = ullPack(merged);
+                }
             }
+        } else {
+            /* ps > min_p: currently only ps=14, min_p=13 */
+            ullFold14To13(acc, src);
         }
     }
 
@@ -2337,14 +2404,14 @@ void pfmergeCommand(client *c) {
         oldsize = kvobjAllocSize(kv);
 
     /* Build a fresh ULL dense sds and swap it in, mirroring hllSparseToDenseUltra. */
-    sds s = sdsnewlen(NULL, HLL_ULTRA_DENSE_SIZE(HLL_ULTRA_P));
+    sds s = sdsnewlen(NULL, HLL_ULTRA_DENSE_SIZE(min_p));
     hdr = (struct hllhdr*)s;
     memcpy(hdr->magic, "HYLL", 4);
     hdr->encoding = HLL_ULTRA;
     hdr->notused[1] = 0; hdr->notused[2] = 0;
-    HLL_ULTRA_SET_P(hdr, HLL_ULTRA_P);
+    HLL_ULTRA_SET_P(hdr, min_p);
     HLL_INVALIDATE_CACHE(hdr);
-    memcpy(hdr->registers, acc, HLL_REGISTERS);
+    memcpy(hdr->registers, acc, (size_t)1 << min_p);
     zfree(acc);
     sdsfree(kv->ptr);
     kv->ptr = s;
@@ -2608,7 +2675,7 @@ void pfdebugCommand(client *c) {
             int64_t oldlen = (int64_t) stringObjectLen(o);
             int todense_err;
             if (server.hll_dense_encoding == HLL_DENSE_ENCODING_ULTRA) {
-                todense_err = hllSparseToDenseUltra(o);
+                todense_err = hllSparseToDenseUltra(o, server.hll_ultra_p);
             } else {
                 todense_err = hllSparseToDense(o);
             }
