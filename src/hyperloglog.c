@@ -212,6 +212,9 @@ struct hllhdr {
 #define HLL_ULTRA_DENSE_SIZE(p) (HLL_HDR_SIZE + HLL_ULTRA_REGISTERS(p))
 /* HLL_ULTRA_P is no longer a compile-time constant — use server.hll_ultra_p at runtime.
  * Valid range: HLL_ULTRA_P_MIN..HLL_ULTRA_P_MAX (defined in server.h). */
+#define HLL_ULTRA_TAINT_BIT 0x01 /* notused[1] bit0: ULL holds rho-only (classic-derived) data */
+#define HLL_ULTRA_GET_TAINT(hdr) ((hdr)->notused[1] & HLL_ULTRA_TAINT_BIT)
+#define HLL_ULTRA_SET_TAINT(hdr)  ((hdr)->notused[1] |= HLL_ULTRA_TAINT_BIT)
 
 static char *invalid_hll_err = "-INVALIDOBJ Corrupted HLL object detected";
 
@@ -770,9 +773,26 @@ static uint64_t ullCountRegisters(const uint8_t *registers, int p) {
     return (uint64_t)llround(est); /* whole estimator pipeline is double, so llround (not llroundl) is the matching precision */
 }
 
-/* Public wrapper: cardinality estimate for a ULL key header. */
+/* Forward declaration: defined after hllSigma/hllTau further below. */
+uint64_t hllCountFromHisto(int *reghisto, int p);
+
+/* Public wrapper: cardinality estimate for a ULL key header.
+ * If the taint bit is set, the registers hold rho-only (classic-derived) data
+ * so we use the p-parameterized classic estimator (hllCountFromHisto) instead
+ * of FGRA, which is calibrated only for native ULL register values. */
 static uint64_t ullCount(struct hllhdr *hdr) {
-    return ullCountRegisters(hdr->registers, HLL_ULTRA_GET_P(hdr));
+    int p = HLL_ULTRA_GET_P(hdr);
+    if (HLL_ULTRA_GET_TAINT(hdr)) {
+        int reghisto[64] = {0};
+        size_t m = (size_t)1 << p;
+        for (size_t i = 0; i < m; i++) {
+            int rho = ullRegToRho(hdr->registers[i], p);
+            if (rho < 0) rho = 0; if (rho > 63) rho = 63;
+            reghisto[rho]++;
+        }
+        return hllCountFromHisto(reghisto, p);
+    }
+    return ullCountRegisters(hdr->registers, p);
 }
 
 /* Self-test for the UltraLogLog dense codec + add path. Returns NULL on
@@ -1410,6 +1430,18 @@ double hllTau(double x) {
     return z / 3;
 }
 
+/* Cardinality from a register histogram at precision p (Ertl tau/sigma).
+ * Parameterized version of the classic HLL estimator used by hllCount().
+ * At p==HLL_P this produces byte-identical results to the original hllCount(). */
+uint64_t hllCountFromHisto(int *reghisto, int p) {
+    double m = (double)((size_t)1 << p);
+    int Q = 64 - p, j;
+    double z = m * hllTau((m - reghisto[Q + 1]) / m);
+    for (j = Q; j >= 1; --j) { z += reghisto[j]; z *= 0.5; }
+    z += m * hllSigma(reghisto[0] / m);
+    return (uint64_t) llroundl(HLL_ALPHA_INF * m * m / z);
+}
+
 /* Return the approximated cardinality of the set based on the harmonic
  * mean of the registers values. 'hdr' points to the start of the SDS
  * representing the String object holding the HLL representation.
@@ -1425,9 +1457,6 @@ uint64_t hllCount(struct hllhdr *hdr, int *invalid) {
     /* UltraLogLog uses its own histogram-FGRA estimator, not the HLL formula. */
     if (hdr->encoding == HLL_ULTRA) return ullCount(hdr);
 
-    double m = HLL_REGISTERS;
-    double E;
-    int j;
     /* Note that reghisto size could be just HLL_Q+2, because HLL_Q+1 is
      * the maximum frequency of the "000...1" sequence the hash function is
      * able to return. However it is slow to check for sanity of the
@@ -1447,18 +1476,7 @@ uint64_t hllCount(struct hllhdr *hdr, int *invalid) {
         serverPanic("Unknown HyperLogLog encoding in hllCount()");
     }
 
-    /* Estimate cardinality from register histogram. See:
-     * "New cardinality estimation algorithms for HyperLogLog sketches"
-     * Otmar Ertl, arXiv:1702.01284 */
-    double z = m * hllTau((m-reghisto[HLL_Q+1])/(double)m);
-    for (j = HLL_Q; j >= 1; --j) {
-        z += reghisto[j];
-        z *= 0.5;
-    }
-    z += m * hllSigma(reghisto[0]/(double)m);
-    E = llroundl(HLL_ALPHA_INF*m*m/z);
-
-    return (uint64_t) E;
+    return hllCountFromHisto(reghisto, HLL_P);
 }
 
 /* Call hllDenseAdd() or hllSparseAdd() according to the HLL encoding. */
@@ -2055,13 +2073,18 @@ void pfcountCommand(client *c) {
         int has_ull = 0, has_classic = 0;
 
         /* First pass: determine which encodings are present. */
+        int has_taint = 0;
         for (j = 1; j < c->argc; j++) {
             kvobj *o = lookupKeyRead(c->db,c->argv[j]);
             if (o == NULL) continue;
             if (isHLLObjectOrReply(c,o) != C_OK) return;
             hdr = o->ptr;
-            if (hdr->encoding == HLL_ULTRA) has_ull = 1;
-            else has_classic = 1;
+            if (hdr->encoding == HLL_ULTRA) {
+                has_ull = 1;
+                if (HLL_ULTRA_GET_TAINT(hdr)) has_taint = 1;
+            } else {
+                has_classic = 1;
+            }
         }
 
         if (!has_ull) {
@@ -2080,7 +2103,7 @@ void pfcountCommand(client *c) {
                 }
             }
             addReplyLongLong(c,hllCount(hdr,NULL));
-        } else if (!has_classic) {
+        } else if (!has_classic && !has_taint) {
             /* All-ULL path: union in ULL domain at min_p, estimate with FGRA. */
             int min_p = HLL_ULTRA_P_MAX;
             for (j = 1; j < c->argc; j++) {
@@ -2113,12 +2136,25 @@ void pfcountCommand(client *c) {
             addReplyLongLong(c, (long long)ullCountRegisters(acc, min_p));
             zfree(acc);
         } else {
-            /* Mixed path: down-convert ULL to classic rho, merge all into RAW. */
-            uint8_t max[HLL_HDR_SIZE+HLL_REGISTERS], *registers;
-            memset(max,0,sizeof(max));
-            hdr = (struct hllhdr*) max;
-            hdr->encoding = HLL_RAW;
-            registers = max + HLL_HDR_SIZE;
+            /* Mixed path (classic + ULL): union in ULL domain at min_p, then
+             * estimate with the p-parameterized classic estimator (taint path).
+             * Classic sources are gathered via hllMerge→max→ullApplyClassicReg;
+             * ULL sources are union/folded directly into acc. */
+            int min_p = HLL_ULTRA_P_MAX;
+            for (j = 1; j < c->argc; j++) {
+                kvobj *o = lookupKeyRead(c->db,c->argv[j]);
+                if (o == NULL) continue;
+                struct hllhdr *shdr = o->ptr;
+                if (shdr->encoding == HLL_ULTRA) {
+                    int ps = HLL_ULTRA_GET_P(shdr);
+                    if (ps < min_p) min_p = ps;
+                }
+            }
+            uint8_t *acc = zcalloc((size_t)1 << min_p);
+            /* Gather classic sources into a temporary RAW max[] array. */
+            uint8_t max_classic[HLL_REGISTERS];
+            memset(max_classic, 0, sizeof(max_classic));
+            int classic_err = 0;
             for (j = 1; j < c->argc; j++) {
                 kvobj *o = lookupKeyRead(c->db,c->argv[j]);
                 if (o == NULL) continue;
@@ -2126,27 +2162,44 @@ void pfcountCommand(client *c) {
                 if (shdr->encoding == HLL_ULTRA) {
                     int ps = HLL_ULTRA_GET_P(shdr);
                     uint8_t *src = shdr->registers;
-                    size_t ms = HLL_ULTRA_REGISTERS(ps);
-                    for (size_t i = 0; i < ms; i++) {
-                        if (src[i]) {
-                            int rho = ullRegToRho(src[i], ps);
-                            /* Map p=13 register back to the classic p=14 index.
-                             * Each p=13 register covers a pair of p=14 registers. */
-                            long base = (ps < 14) ? (long)(i << (14 - ps)) : (long)i;
-                            long span = (ps < 14) ? (1L << (14 - ps)) : 1L;
-                            for (long k = 0; k < span; k++) {
-                                if (rho > registers[base + k]) registers[base + k] = (uint8_t)rho;
+                    if (ps == min_p) {
+                        size_t ms = (size_t)1 << min_p;
+                        for (size_t i = 0; i < ms; i++) {
+                            if (src[i]) {
+                                uint64_t merged = ullUnpack(acc[i]) | ullUnpack(src[i]);
+                                acc[i] = ullPack(merged);
                             }
                         }
+                    } else {
+                        /* ps > min_p: currently only ps=14, min_p=13 */
+                        ullFold14To13(acc, src);
                     }
                 } else {
-                    if (hllMerge(registers,o) == C_ERR) {
-                        addReplyError(c,invalid_hll_err);
-                        return;
+                    if (hllMerge(max_classic, o) == C_ERR) {
+                        classic_err = 1;
+                        break;
                     }
                 }
             }
-            addReplyLongLong(c,hllCount(hdr,NULL));
+            if (classic_err) {
+                zfree(acc);
+                addReplyError(c,invalid_hll_err);
+                return;
+            }
+            /* Fold classic rho data into acc via ullApplyClassicReg. */
+            for (long i = 0; i < HLL_REGISTERS; i++) {
+                if (max_classic[i]) ullApplyClassicReg(acc, min_p, i, max_classic[i]);
+            }
+            /* Estimate using the classic estimator (taint/rho-only path). */
+            int reghisto[64] = {0};
+            size_t m = (size_t)1 << min_p;
+            for (size_t i = 0; i < m; i++) {
+                int rho = ullRegToRho(acc[i], min_p);
+                if (rho < 0) rho = 0; if (rho > 63) rho = 63;
+                reghisto[rho]++;
+            }
+            addReplyLongLong(c, (long long)hllCountFromHisto(reghisto, min_p));
+            zfree(acc);
         }
         return;
     }
@@ -2217,14 +2270,18 @@ void pfmergeCommand(client *c) {
 
     /* First pass: determine which encodings are present among all sources
      * (including the dest argv[1], which is itself a source). */
-    int has_ull = 0, has_classic = 0;
+    int has_ull = 0, has_classic = 0, has_taint = 0;
     for (j = 1; j < c->argc; j++) {
         kvobj *o = lookupKeyRead(c->db, c->argv[j]);
         if (o == NULL) continue;
         if (isHLLObjectOrReply(c, o) != C_OK) return;
         hdr = o->ptr;
-        if (hdr->encoding == HLL_ULTRA) has_ull = 1;
-        else has_classic = 1;
+        if (hdr->encoding == HLL_ULTRA) {
+            has_ull = 1;
+            if (HLL_ULTRA_GET_TAINT(hdr)) has_taint = 1;
+        } else {
+            has_classic = 1;
+        }
     }
 
     if (!has_ull) {
@@ -2288,12 +2345,26 @@ void pfmergeCommand(client *c) {
         return;
     }
 
-    if (has_ull && has_classic) {
-        /* Mixed path: down-convert ULL to classic rho, merge all into RAW max[].
-         * Result is a CLASSIC dense object (accurate because the classic estimator
-         * is calibrated for rho-only data; the ULL FGRA estimator is not). */
-        uint8_t max[HLL_REGISTERS];
-        memset(max,0,sizeof(max));
+    if (has_ull && (has_classic || has_taint)) {
+        /* Mixed path (classic + ULL, or tainted ULL): union in ULL domain at min_p.
+         * Classic sources are gathered via hllMerge→max→ullApplyClassicReg;
+         * ULL sources are union/folded directly into acc.
+         * Result is a TAINTED ULL dense object: a later PFCOUNT will use
+         * hllCountFromHisto (classic estimator) rather than FGRA. */
+        int min_p = HLL_ULTRA_P_MAX;
+        for (j = 1; j < c->argc; j++) {
+            kvobj *o = lookupKeyRead(c->db, c->argv[j]);
+            if (o == NULL) continue;
+            hdr = o->ptr;
+            if (hdr->encoding == HLL_ULTRA) {
+                int ps = HLL_ULTRA_GET_P(hdr);
+                if (ps < min_p) min_p = ps;
+            }
+        }
+        uint8_t *acc = zcalloc((size_t)1 << min_p);
+        /* Gather classic sources into a temporary RAW max[] array. */
+        uint8_t max_classic[HLL_REGISTERS];
+        memset(max_classic, 0, sizeof(max_classic));
         for (j = 1; j < c->argc; j++) {
             kvobj *o = lookupKeyRead(c->db, c->argv[j]);
             if (o == NULL) continue;
@@ -2301,26 +2372,32 @@ void pfmergeCommand(client *c) {
             if (hdr->encoding == HLL_ULTRA) {
                 int ps = HLL_ULTRA_GET_P(hdr);
                 uint8_t *src = hdr->registers;
-                size_t ms = HLL_ULTRA_REGISTERS(ps);
-                for (size_t i = 0; i < ms; i++) {
-                    if (src[i]) {
-                        int rho = ullRegToRho(src[i], ps);
-                        /* Map p=13 register back to the classic p=14 index. */
-                        long base = (ps < 14) ? (long)(i << (14 - ps)) : (long)i;
-                        long span = (ps < 14) ? (1L << (14 - ps)) : 1L;
-                        for (long k = 0; k < span; k++) {
-                            if (rho > max[base + k]) max[base + k] = (uint8_t)rho;
+                if (ps == min_p) {
+                    size_t ms = (size_t)1 << min_p;
+                    for (size_t i = 0; i < ms; i++) {
+                        if (src[i]) {
+                            uint64_t merged = ullUnpack(acc[i]) | ullUnpack(src[i]);
+                            acc[i] = ullPack(merged);
                         }
                     }
+                } else {
+                    /* ps > min_p: currently only ps=14, min_p=13 */
+                    ullFold14To13(acc, src);
                 }
             } else {
-                if (hllMerge(max,o) == C_ERR) {
+                if (hllMerge(max_classic, o) == C_ERR) {
+                    zfree(acc);
                     addReplyError(c,invalid_hll_err);
                     return;
                 }
             }
         }
+        /* Fold classic rho data into acc via ullApplyClassicReg. */
+        for (long i = 0; i < HLL_REGISTERS; i++) {
+            if (max_classic[i]) ullApplyClassicReg(acc, min_p, i, max_classic[i]);
+        }
 
+        /* Create / unshare the destination key. */
         dictEntryLink link;
         kvobj *kv = lookupKeyWriteWithLink(c->db,c->argv[1],&link);
         if (kv == NULL) {
@@ -2334,18 +2411,19 @@ void pfmergeCommand(client *c) {
         if (server.memory_tracking_enabled)
             oldsize = kvobjAllocSize(kv);
 
-        /* The mixed result is always classic dense; build a fresh dense object so
-         * it works regardless of the destination's prior encoding (classic sparse/
-         * dense or ultra) -- hllSparseToDense() cannot convert a ULL dest. */
-        sds s = sdsnewlen(NULL, HLL_DENSE_SIZE);
-        struct hllhdr *nh = (struct hllhdr*)s;
-        memcpy(nh->magic, "HYLL", 4);
-        nh->encoding = HLL_DENSE;
-        HLL_INVALIDATE_CACHE(nh);
-        hllDenseCompress(nh->registers, max);
+        /* Build a fresh ULL dense sds with TAINT set. */
+        sds s = sdsnewlen(NULL, HLL_ULTRA_DENSE_SIZE(min_p));
+        hdr = (struct hllhdr*)s;
+        memcpy(hdr->magic, "HYLL", 4);
+        hdr->encoding = HLL_ULTRA;
+        hdr->notused[1] = 0; hdr->notused[2] = 0;
+        HLL_ULTRA_SET_P(hdr, min_p);
+        HLL_ULTRA_SET_TAINT(hdr);
+        HLL_INVALIDATE_CACHE(hdr);
+        memcpy(hdr->registers, acc, (size_t)1 << min_p);
+        zfree(acc);
         sdsfree(kv->ptr);
         kv->ptr = s;
-        hdr = kv->ptr;
 
         if (server.memory_tracking_enabled)
             updateSlotAllocSize(c->db, getKeySlot(c->argv[1]->ptr), kv, oldsize, kvobjAllocSize(kv));

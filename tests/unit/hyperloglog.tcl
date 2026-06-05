@@ -461,7 +461,7 @@ start_server {tags {"hll"}} {
         r config set hll-dense-encoding classic
     }
 
-    test {ULL: cross-encoding PFMERGE (classic + ultra) is correct, result classic} {
+    test {ULL: cross-encoding PFMERGE (classic + ultra) is correct, result ultra (tainted)} {
         r del c u d2
         r config set hll-sparse-max-bytes 0
         r config set hll-dense-encoding classic
@@ -469,7 +469,7 @@ start_server {tags {"hll"}} {
         r config set hll-dense-encoding ultra
         for {set i 7500} {$i < 22500} {incr i} { r pfadd u "z$i" }
         r pfmerge d2 c u
-        assert_equal {dense} [r pfdebug encoding d2]
+        assert_equal {ultra} [r pfdebug encoding d2]
         assert {abs([r pfcount d2] - 22500) < 22500*0.04}
         r config set hll-sparse-max-bytes 3000
         r config set hll-dense-encoding classic
@@ -517,8 +517,8 @@ start_server {tags {"hll"}} {
         assert_equal {ultra} [r pfdebug encoding md]
         r config set hll-dense-encoding classic
         for {set i 2500} {$i < 7500} {incr i} { r pfadd cs "m$i" }  ;# cs is classic
-        r pfmerge md cs                                             ;# ULL dest + classic src
-        assert_equal {dense} [r pfdebug encoding md]
+        r pfmerge md cs                                             ;# ULL dest + classic src -> tainted ultra
+        assert_equal {ultra} [r pfdebug encoding md]
         assert {abs([r pfcount md] - 7500) < 7500*0.05}
         r config set hll-sparse-max-bytes 3000
     }
@@ -559,6 +559,54 @@ start_server {tags {"hll"}} {
         r pfmerge dm u14 u13
         assert_equal {ultra} [r pfdebug encoding dm]
         assert {abs([r pfcount dm] - 30000) < 30000*0.04}
+        r config set hll-sparse-max-bytes 3000; r config set hll-dense-encoding classic; r config set hll-ultra-p 14
+    }
+
+    test {ULL p13: classic + ultra-p13 PFMERGE is tainted ULL and accurate} {
+        r del cclassic u13b dmix; r config set hll-sparse-max-bytes 0
+        r config set hll-dense-encoding classic
+        for {set i 0} {$i < 15000} {incr i} { r pfadd cclassic "z$i" }
+        r config set hll-dense-encoding ultra; r config set hll-ultra-p 13
+        for {set i 7500} {$i < 22500} {incr i} { r pfadd u13b "z$i" }
+        r pfmerge dmix cclassic u13b
+        assert_equal {ultra} [r pfdebug encoding dmix]
+        assert {abs([r pfcount dmix] - 22500) < 22500*0.05}
+        assert {abs([r pfcount dmix] - 22500) < 22500*0.05}
+        r config set hll-sparse-max-bytes 3000; r config set hll-dense-encoding classic; r config set hll-ultra-p 14
+    }
+    test {ULL p13: multi-key PFCOUNT across classic + ultra-p13} {
+        assert {abs([r pfcount cclassic u13b] - 22500) < 22500*0.05}
+    }
+    test {ULL: mixed classic + ultra-p14 PFMERGE now yields accurate ultra (unified)} {
+        r del c14 u14b d14; r config set hll-sparse-max-bytes 0
+        r config set hll-dense-encoding classic
+        for {set i 0} {$i < 15000} {incr i} { r pfadd c14 "z$i" }
+        r config set hll-dense-encoding ultra; r config set hll-ultra-p 14
+        for {set i 7500} {$i < 22500} {incr i} { r pfadd u14b "z$i" }
+        r pfmerge d14 c14 u14b
+        assert {abs([r pfcount d14] - 22500) < 22500*0.04}
+        r config set hll-sparse-max-bytes 3000; r config set hll-dense-encoding classic
+    }
+
+    test {ULL p13: taint is infectious through PFMERGE with a pure ULL key} {
+        r del ct uc r1; r config set hll-sparse-max-bytes 0
+        # Build a classic source key, then merge it with a pure ULL p13 key into dest ct
+        # to get a tainted ULL p13 key
+        r config set hll-dense-encoding classic
+        for {set i 0} {$i < 15000} {incr i} { r pfadd ct "z$i" }
+        r config set hll-dense-encoding ultra; r config set hll-ultra-p 13
+        # Build a temporary pure ULL p13 seed key and merge classic ct + ultra seed -> ct becomes tainted ULL p13
+        r pfadd uc "seed"
+        r pfmerge ct ct uc              ;# dest=ct, sources=ct(classic)+uc(ultra p13) -> tainted ULL p13
+        assert_equal {ultra} [r pfdebug encoding ct]
+        # Now build the pure ULL p13 key (z10000..z24999)
+        r del uc
+        for {set i 10000} {$i < 25000} {incr i} { r pfadd uc "z$i" }
+        # union of z0..z14999 and z10000..z24999 = z0..z24999 = 25000 distinct
+        r pfmerge r1 ct uc              ;# tainted ULL + pure ULL, NO classic source
+        assert {abs([r pfcount r1] - 25000) < 25000*0.06}
+        # multi-key PFCOUNT of tainted ULL + pure ULL
+        assert {abs([r pfcount ct uc] - 25000) < 25000*0.06}
         r config set hll-sparse-max-bytes 3000; r config set hll-dense-encoding classic; r config set hll-ultra-p 14
     }
 }
